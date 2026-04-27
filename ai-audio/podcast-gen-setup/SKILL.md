@@ -90,7 +90,55 @@ python3 serve.py
 3. **API_PATHS 判斷** — 以 `startswith` 匹配 `/generate`, `/models`, `/health`, `/download`
 4. **urllib.request.urlopen** — 比 `subprocess` curl 更穩定
 
+## Timeout 設置（關鍵！）
+
+TTS 生成在 CPU 上需要 20-30 秒，必須設置足夠的超時：
+
+- **Vue App (`App.vue`)** — generate fetch timeout：**120 秒**
+- **serve.py proxy** — `urllib.request.urlopen(timeout=300)`：**300 秒**
+- **禁止**用 Node.js server（會導致 TCP 握手成功但 HTTP 無 response）
+
+### 進程管理
+每次重啟 backend 前，必須 kill 乾淨：
+```bash
+# 殺掉所有佔用 port 的進程
+lsof -i :8765 -i :5174 | grep LISTEN | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null
+sleep 1
+# 重新啟動
+```
+
+常見問題：多個 backend 實例同時在 8080 和 8765 跑，導致請求被隨機分配到卡住的實例。
+
+### serve.py 穩定性
+serve.py 在後端處理慢或重啟時會卡死（CLOSE_WAIT 僵屍連接）。跡象：
+- `curl http://localhost:5174/` 超時
+- `lsof -i :5174` 顯示 `CLOSE_WAIT` 狀態
+
+解決：kill 掉舊的 serve.py，確認 port free，再重啟。
+
+### 驗證服務正常
+```bash
+# 1. proxy 活著
+curl http://localhost:5174/health
+
+# 2. backend 活著
+curl http://localhost:8765/health
+
+# 3. 模型已載入（第一次可能 30 秒，之後 instant）
+curl http://localhost:8765/models/status
+
+# 4. 完整 generate 測試
+curl -X POST http://localhost:5174/generate \
+  -H "Content-Type: application/json" \
+  -d '{"script":"[男] 測試","language":"mandarin","speed":1,"male_voice":"uncle_fu","female_voice":"vivian"}' \
+  --max-time 60
+```
+
 ## 已知的坑
+
+### Bug: seg 變量名錯誤（main.py line ~161）
+❌ 錯誤：`speaker=speaker, text=text`（未定義變量）  
+✅ 正確：`speaker=seg["speaker"], text=seg["text"]`
 
 ### FFmpeg concat 格式
 ❌ 錯誤：`-f concat,separate`
