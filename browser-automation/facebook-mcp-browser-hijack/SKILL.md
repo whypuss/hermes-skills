@@ -111,23 +111,56 @@ r = await sr('Runtime.evaluate', {
 
 ### 上傳圖片
 
-**關鍵發現**：`input[type="file"]` 在 dialog 內是隱藏的（`w=0, h=0`），但 `set_input_files()` 直接設定它有效，不需要點擊任何「相片」按鈕。
+**⚠️ FB React 會攔截 `input.files` 替換 — `set_input_files()` 無效！**
+
+FB 的 React `input[type=file]` 用 `Object.defineProperty` 替換了 `files` getter，外部賦值直接被忽略。filechooser 事件能觸發但 React state 不更新。
+
+**解決方案：base64 → Blob → File → DataTransfer → dispatchEvent**
 
 ```python
-# Dialog 已經打開狀態下，直接設定圖片
-dialog = fb_page.locator('[role="dialog"]').filter(has_text='在想')
-file_input = dialog.locator('input[type="file"]').first
-count = await file_input.count()
-# count == 1 表示 dialog 已打開
-await file_input.set_input_files('/path/to/image.jpg')
-await asyncio.sleep(2)  # 等待預覽出現
+import base64 as _b64
+with open(image_path, "rb") as f:
+    b64_data = _b64.b64encode(f.read()).decode()
 
-# 驗證：dialog 內出現多個 preview img
-preview_count = await fb_page.evaluate(
-    'document.querySelectorAll(\'[role="dialog"] img[src*="fbcdn"], '
-    '[role="dialog"] img[src*="scontent"]\').length'
-)
-print(f'Preview images: {preview_count}')  # > 0 = 成功
+inject_r = await fb.evaluate("""(b64) => {
+    const binaryString = atob(b64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: 'image/jpeg' });
+    const file = new File([blob], 'upload.jpg', { type: 'image/jpeg', lastModified: Date.now() });
+    const inputs = document.querySelectorAll('input[type=file]');
+    for (let i = 0; i < inputs.length; i++) {
+        const inp = inputs[i];
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        Object.defineProperty(inp, 'files', {
+            value: dt.files,
+            writable: true,
+            configurable: true
+        });
+        const tracker = inp._valueTracker;
+        if (tracker) { tracker.setValue(''); }
+        inp.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    }
+    return { ok: true, inputsUpdated: inputs.length };
+}""", b64_data)
+
+# 驗證：等 blob URL 預覽出現
+for _ in range(10):
+    await asyncio.sleep(1)
+    preview = await fb.evaluate("""() => {
+        var d = document.querySelector('[role=dialog]');
+        if (!d) return null;
+        var imgs = d.querySelectorAll('img[src]');
+        for (var img of imgs) {
+            if (img.src.startsWith('blob:')) return img.src.slice(0, 80);
+        }
+        return null;
+    }""")
+    if preview: break
 ```
 
 ### 輸入文字（FB 不需要 CDP，用 Playwright 原生）
