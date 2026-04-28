@@ -239,3 +239,104 @@ async def search_google_image(ctx, topic: str) -> str:
 - CDP `page.mouse.click(button='right')` 無法讀取原生 context menu
 - `page.give_files()` 只用於上傳，無法攔截下載對話框
 - Google captcha 是 IP 級別的，無瀏覽器指紋繞過可能（除非用代理）
+
+---
+
+## Threads（threads.net）圖文發文（2026-05）
+
+Threads 和 Instagram 共用同一個 Chromium session（threads.com = threads.net）。但 CDP 連線行為不同。
+
+### CDP 連線：browser-level WS URL（Threads 專用）
+
+```python
+import urllib.request, json
+from playwright.async_api import async_playwright
+
+def get_browser_ws():
+    """取得 browser-level WS URL，不要用 page-level WS URL"""
+    req = urllib.request.Request(
+        "http://localhost:9333/json/version",
+        headers={"User-Agent": "Mozilla/5.0 Chrome-CDP-Client"}
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read()).get('webSocketDebuggerUrl')
+
+async def _post_threads():
+    browser_ws = get_browser_ws()  # ws://localhost:9333/devtools/browser/xxx
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(browser_ws, timeout=20000)
+        # ✅ browser.contexts[0].pages 有內容
+        th = browser.contexts[0].pages[0]
+        await th.goto('https://www.threads.net', wait_until='load', timeout=30000)
+        await asyncio.sleep(5)
+        # ... 繼續 workflow
+```
+
+**⚠️ 重要差異：**
+- 連 `http://localhost:9333`（HTTP endpoint）→ hang，timeout
+- 連 page-level WS URL (`/devtools/page/xxx`) → 返回 Browser 物件，但 `contexts[0].pages` 是空的（隔離）
+- 連 browser-level WS URL (`/json/version` → `/devtools/browser/xxx`) → 正常，`contexts[0].pages[0]` 是 Threads 分頁
+
+### Threads Composer 步驟
+
+1. 點擊「有什麼新鮮事？」按鈕（`innerText.includes('有什麼新鮮事')`）
+2. 等 2s → dialog 出現
+3. **圖片上傳（✅正確方式）**：用 `locator.set_input_files()`
+   - Threads dialog 的 `input[type=file]` 是 `display:none` + `hidden=False`
+   - JS `click()` 這個 input 不會觸發 OS file dialog，Playwright `filechooser` 事件也不會響
+   - **正確做法：Playwright `set_input_files()` 直接 CDP 賦值 + 觸發 change 事件**
+   ```python
+   # 點 SVG 進入選擇媒體狀態（可選，讓 dialog 進入正確狀態）
+   await threads_page.locator(
+       '[role="dialog"] svg[aria-label="附加影音內容"]'
+   ).last.click(timeout=3000, force=True)
+   await asyncio.sleep(0.5)
+
+   # 直接用 Playwright set_input_files（CDP setFileInputFiles，繞過 OS dialog）
+   inp_locator = threads_page.locator('[role="dialog"] input[type=file]').last
+   await inp_locator.set_input_files(image_path, timeout=5000)
+   log.debug(f"Image set: {image_path}")
+
+   # 等 Threads 上傳處理（8 秒，blob URL 生成 = 成功信號）
+   await asyncio.sleep(8)
+   ```
+   **千萬不要** 按 Escape 來關 OS 檔案選擇窗口——`set_input_files()` 不觸發 OS dialog，窗口根本不會出現。
+4. 等 8s 讓圖片上傳完成（blob URL 出現 = 成功）
+5. 打字：找到 `[contenteditable=true]` 或 `[role=textbox]`，`keyboard.type()` 輸入文字
+6. 點「新增到串文」（dialog 內，坐標 mouse.click）
+7. 等 3s
+8. 點「發佈」（dialog 內，坐標 mouse.click）
+9. 等 10s → dialog 自動關閉 = 成功
+
+### Threads 驗證 profile URL
+
+用戶名不是 IG 用戶名！要從 Threads 首頁找：
+```python
+profile_info = await th.evaluate("""() => {
+    const links = document.querySelectorAll('a[href*="/@"]');
+    const usernames = [];
+    for (const l of links) {
+        const href = l.getAttribute('href');
+        if (href && !href.includes('/repost') && !href.includes('/tag')) {
+            usernames.push(href);
+        }
+    }
+    return [...new Set(usernames)].slice(0, 5);
+}""")
+# 結果：['/@whypuss_fun', '/@is.this.ramen', ...]
+# profile URL: https://www.threads.net/@whypuss_fun
+```
+
+### Threads 的隱藏 file input 模式
+
+Threads dialog 內的 `input[type=file]` 是 `display:none` + `hidden=False`：
+- `hidden=False` 不等於可見，瀏覽器仍然 apply `display:none`
+- JS `click()` 這個 input 不會觸發 OS file dialog
+- `svg[aria-label="附加影音內容"]` 點了也不會自動觸發 filechooser
+- **唯一有效方式：`Playwright locator.set_input_files()`**，原理是 CDP `Page.setFileInputFiles` 直接賦值並觸發 React change 事件，完全繞過 OS dialog
+
+### Threads 發文成功判斷
+
+- Dialog 關閉（`!document.querySelector('[role=dialog]')`) = 發文成功
+- 驗證：去 `https://www.threads.net/@<username>` 等 6-8s，檢查 body 內是否有關鍵字
+- Threads profile 有延遲，發文後馬上查可能還沒出現

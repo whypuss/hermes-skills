@@ -77,3 +77,67 @@ human-mcp.download → path: "/Users/.../mcp_images/img_xxx.jpg"
 - `/json/new` 需要 **PUT** method，不是 GET
 - URL 包含中文必須 `urllib.parse.quote()` 編碼
 - `urllib.request.Request` 變數名不要覆蓋 FastAPI 的 `req` model（用 `cdp_req` 而非 `req`）
+
+---
+
+# 自動圖片下載（AIpuss-browser / CDP Playwright）
+
+## 自動爬蟲與人工選擇的分工
+
+| 場景 | 工具 |
+|------|------|
+| 大量話題需要自動生成貼文 | CDP Playwright + `requests` 自動下載（Bing Images） |
+| 圖片需要精準視覺選擇 | human-mcp（人類視覺瀏覽 → URL 回傳 AI） |
+
+## Playwright 圖片下載陷阱
+
+### 陷阱 1：APIRequestContext.get() timeout 單位是毫秒
+```python
+# 壞：15ms timeout（極短，任何圖片都來不及下載）
+async with await b_page.context.request.get(img_url, timeout=15) as resp:
+
+# 好：15000ms = 15 秒
+async with await b_page.context.request.get(img_url, timeout=15000) as resp:
+```
+**Playwright 的 `timeout=` 參數，文件寫「毫秒」，實測就是毫秒，不是秒。**
+
+### 陷阱 2：Playwright APIRequestContext.get() 在 async context 回傳 coroutine
+```python
+# 壞：Playwright 的 get() 在 async context 要 await，但 async with 不接受 coroutine
+async with b_page.context.request.get(img_url, timeout=15000) as resp:
+
+# 壞：await async_with 也是錯誤（async with 需要 async context manager protocol）
+async with await b_page.context.request.get(img_url, timeout=15000) as resp:
+
+# 好：用標準 requests library 代替（自帶 redirect、靠譜）
+r = requests.get(img_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
+if r.status_code == 200:
+    img_bytes = r.content
+```
+
+### 陷阱 3：social-mcp post_threads 需要現成的 Threads 標籤
+`post_threads()` 內部會遍歷 `ctx.pages` 找 `threads.net` tab，找不到就回錯誤。  
+**解決**：在 workflow 裡主動開 Threads 標籤，再調用 post_threads：
+```python
+threads_tab = None
+for pg in ctx.pages:
+    if "threads.net" in pg.url and "settings" not in pg.url:
+        threads_tab = pg
+        break
+if not threads_tab:
+    threads_tab = await ctx.new_page()
+    await threads_tab.goto("https://www.threads.net/", wait_until="domcontentloaded", timeout=20000)
+    await asyncio.sleep(3)
+# 現在可以安全調用 post_threads(text, image_path)
+```
+
+## requests vs Playwright request.get()
+
+| 維度 | `requests.get()` | `b_page.context.request.get()` |
+|------|-----------------|-------------------------------|
+| redirect 處理 | 自動跟隨 | 需要手動處理 |
+| timeout 靠譜性 | 是（秒為單位） | 是（毫秒為單位） |
+| cookie/header 繼承 | 需手動設定 | 自動繼承瀏覽器 |
+| 在 async def 內使用 | 同步，直接用 | 需要額外 await |
+
+對於從 Bing Images 爬取的外部 URL（與 Playwright 瀏覽器上下文無關），用 `requests.get()` 更靠譜。

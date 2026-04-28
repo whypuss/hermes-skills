@@ -4,10 +4,78 @@ description: AI Agent 全自動 Facebook 圖文發文工作流 — Google Trends
 category: social-automation
 ---
 
-# Facebook AI-CDP 全自動發文 Workflow
+### Threads 圖文發文（Playwright + CDP，2026-05-01）
 
-## 完整流程
+## 重要：兩步發布流程
+Threads 發文分兩步，錯誤會導致 dialog 永遠不關閉：
+- **第 1 步**：填 caption → 加圖片 → 點「新增到串文」（進入第 2 步）
+- **第 2 步**（caption 頁）：坐標點擊「發佈」→ 正式發出
+- 關鍵：Playwright `locator.click()` 無法觸發 Threads React onClick，必須用 `page.mouse.click(x, y)` 坐標點擊
+- URL：使用 `threads.net`（`threads.com` 已失效，顯示「頁面不存在」）
+
+## 實作片段
+```python
+# 6a: 點「新增到串文」進第 2 步
+pub_btn_info = await threads_page.evaluate("""() => {
+    const d = document.querySelector('[role="dialog"]');
+    const btns = d.querySelectorAll('[role="button"]');
+    for (const b of btns) {
+        if ((b.innerText || '').includes('新增到串文')) {
+            const r = b.getBoundingClientRect();
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }
+    }
+    return null;
+}""")
+await threads_page.mouse.click(pub_btn_info["x"], pub_btn_info["y"])
+await asyncio.sleep(2.5)
+
+# 6b: 在第 2 步坐標點擊「發佈」
+pub2_info = await threads_page.evaluate("""() => {
+    const d = document.querySelector('[role="dialog"]');
+    const btns = d.querySelectorAll('[role="button"]');
+    for (const b of btns) {
+        if ((b.innerText || '').includes('發佈')) {
+            const r = b.getBoundingClientRect();
+            return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+        }
+    }
+    return null;
+}""")
+await threads_page.mouse.click(pub2_info["x"], pub2_info["y"])
 ```
+
+## 圖片上傳：filechooser 優先於 DataTransfer
+Threads React 不接受 JS DataTransfer 注入的虛擬 File（Blob URL），必須用 filechooser.set_files() 給予真實作業系統檔案句柄：
+```python
+fc_set = {"done": False}
+def _on_fc(fc):
+    asyncio.create_task(_handle(fc))
+async def _handle(fc):
+    await fc.set_files(image_path)
+    fc_set["done"] = True
+
+threads_page.on("filechooser", _on_fc)
+await threads_page.locator('[role="dialog"] svg[aria-label="附加影音內容"]').last.click(timeout=3000, force=True)
+# wait for fc_set["done"]
+```
+
+## Tab 檢測
+```python
+if ("threads.com/" in pg.url or "threads.net/" in pg.url) and "settings" not in pg.url:
+```
+
+## 初始導航（threads.net 而非 threads.com）
+```python
+await threads_page.goto("https://www.threads.net/", wait_until="domcontentloaded", timeout=30000)
+```
+
+---
+
+### Facebook 圖文發文（Playwright + CDP，2026-04-27）
+
+## 流程
+1. 打開 Chromium（9333 port，CDP mode）
 Google Trends US 熱搜
     → human-mcp /scrape 自動搜圖下載
     → ai-cdp-browser post_facebook 圖文發布

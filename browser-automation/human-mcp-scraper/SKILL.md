@@ -29,9 +29,15 @@ Python FastAPI server (port 8080)
 - 解決方案：Playwright (Node.js) headless browser + Python FastAPI subprocess
 
 ## 關鍵文件
-- `~/human-mcp/server.py` — FastAPI server (uv run python server.py)
+- `~/human-mcp/server.py` — FastAPI server（有 `/scrape` 端點，綁定 GitHub）
 - `~/human-mcp/scraper.js` — Node.js Playwright 爬蟲（不可刪）
-- `~/human-mcp/package.json` — npm init -y && npm install playwright
+- `~/human-mcp/post_ig.js` — Instagram CDP 發文腳本
+- `~/.kimaki/projects/human-mcp/` — 舊備份（無 `/scrape`），不要混淆
+
+## 重要：正確的 ~/human-mcp/
+- `~/human-mcp/` 是綁定 GitHub 的真正版本，有 `/scrape` + `/download` 端點
+- 運行：`cd ~/human-mcp && uv run python server.py`
+- `~/.kimaki/projects/human-mcp/` 是舊備份，沒有 `/scrape` 端點
 
 ## 啟動方式
 ```bash
