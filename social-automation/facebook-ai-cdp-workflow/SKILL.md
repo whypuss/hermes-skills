@@ -150,19 +150,109 @@ result = await fb.evaluate('''() => {
 4. **blob 在 page 不在 dialog** — 檢測預覽要查 page 層級
 5. **human-mcp 用 localhost:8080** — AIpuss-browser 是 AIpuss-browser，human-mcp 是另一個 server
 6. **上傳後不要按 Escape** — OS 選擇框會自動關，Escape 干擾事件鏈
+## Article 生成（已解決 — CDP Browser Gemini 無需登入）
 
-## Article 生成（待完成）
-目前流程：關鍵字 → 圖片 → **手動寫文**（Gemini API 未設定）
+**重要發現（2026-04-28）**：Gemini 網頁版**不需要 Google 登入**就能免費使用。CDP browser (port 9333) 的 Chromium 可以直接打開 `https://gemini.google.com/app` 並使用。
 
-**需要設定 Gemini API Key** 才能全自動：
-```bash
-# 方案A：設定環境變數
-export GEMINI_API_KEY=your_key_here
-
-# 方案B：用 curl 呼叫 Gemini API
-curl -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d '{"contents":[{"parts":[{"text":"以「{關鍵字}」為主題，寫一篇100字中文Facebook貼文，包含5個hashtag"}]}]}'
+### 完整自動化流程
+```
+關鍵字 → CDP Gemini 生成文章 → human-mcp 搜圖 → post_facebook 圖文發布
 ```
 
-**注意**：CDP browser (port 9333) 無 Google 登入，無法透過 AI Studio 網頁自動化生成文章。
+### Step 2a（新增）: CDP Browser 開 Gemini 並生成文章
+
+```python
+import asyncio
+from playwright.async_api import async_playwright
+from social_mcp.browser_hijack import get_active_cdp_port
+
+async def gemini_generate(topic: str) -> str:
+    port = get_active_cdp_port()
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(f"http://localhost:{port}", timeout=15000)
+        ctx = browser.contexts[0]
+
+        # 找 Gemini 分頁，或新建
+        gemini = None
+        for pg in ctx.pages:
+            if "gemini.google.com" in pg.url:
+                gemini = pg
+                break
+        if not gemini:
+            gemini = await ctx.new_page()
+            await gemini.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=20000)
+            await asyncio.sleep(5)
+
+        await gemini.bring_to_front()
+
+        # 定位編輯區域（新版是 contenteditable div，不是 textarea）
+        await gemini.click('[contenteditable="true"]', timeout=5000)
+        await asyncio.sleep(1)
+
+        # 清空舊內容
+        await gemini.keyboard.press('Control+A')
+        await asyncio.sleep(0.3)
+        await gemini.keyboard.press('Delete')
+        await asyncio.sleep(0.5)
+
+        # 構造 prompt
+        prompt = f"""請用繁體中文為 Facebook 粉絲專頁撰寫一篇 100 字以內的貼文，內容關於：{topic}
+
+要求：
+- 吸引眼球的內容
+- 100字以內
+- 加入5個相關hashtag
+- 活潑的語氣
+- 不要用emoji
+
+直接給我文章內容即可。"""
+
+        # 用 keyboard.type 打字（比 execCommand insertText 可靠）
+        await gemini.keyboard.type(prompt, delay=30)
+        await asyncio.sleep(1)
+
+        # 按 Enter 發送
+        await gemini.keyboard.press('Enter')
+        print("已發送，等待 Gemini 回覆...")
+
+        # 等候回覆（檢測 "Gemini 說了" 出現）
+        for i in range(20):
+            await asyncio.sleep(2)
+            try:
+                body = gemini.frame.inner_text() if gemini.frame else await gemini.evaluate("() => document.body.innerText")
+                user_idx = body.rfind('你說了')
+                if user_idx >= 0:
+                    rest = body[user_idx + 20:]
+                    gemini_idx = rest.find('Gemini 說了')
+                    if gemini_idx >= 0:
+                        response = rest[gemini_idx + 20:].split('要求：')[0].strip()
+                        # 清理殘留 prompt
+                        if len(response) > 30:
+                            await browser.close()
+                            return response
+            except Exception:
+                pass
+            print(f"[{2*(i+1)}s] waiting...")
+
+        await browser.close()
+        return None
+```
+
+### 關鍵技術細節
+
+| 項目 | 發現 |
+|------|------|
+| 編輯區域 | `contenteditable="true"` DIV（不是 textarea） |
+| 打字方式 | `keyboard.type()` + `Control+A` `Delete` 清空 |
+| 發送方式 | `keyboard.press('Enter')` |
+| 用戶消息標記 | `你說了`（出現在消息上方） |
+| AI 回覆標記 | `Gemini 說了` |
+| 登入需求 | **不需要**，免費版 Gemini 即可用 |
+| 回覆解析 | `document.body.innerText`（非標準 message bubble selector） |
+
+### 陷阱
+
+1. **不要用 CDP JS execCommand insertText** — 對 `contenteditable` div 無效，必須用 `keyboard.type()`
+2. **不要等 `[data-message-author-role]`** — 新版 Gemini 不使用這個屬性
+3. **不要用 `continue=https://gemini.google.com/` 登入** — CDP browser 無 Google session，直接跳過登入
+4. **耐心等回覆** — Gemini 生成需要 5-15 秒
