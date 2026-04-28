@@ -44,14 +44,44 @@ await asyncio.sleep(0.5)
 ### 5. 流程步驟（實測有效版）
 1. **Step 0**: 檢查並按 Escape 關閉殘留 dialog
 2. 點「新貼文」（SVG aria-label）
-3. 等初始 dialog → 點「從電腦選擇」（Playwright locator）
-4. FileChooser set_files 圖片
+3. 等 2-3s → **此時只會出現一個選擇來源的 dialog**，需再點「從電腦選擇」才會出現 file input
+4. File input 出現後 set_input_files 圖片
 5. 等 3s → 點兩次「下一步」（CDP JS click）
 6. 等 caption 頁出現
 7. `fill()` 填 caption → 等 3s → ArrowRight 鍵
 8. 點「分享」（CDP pointer+mouse 鏈，在 dialog 內）
 9. 等「分享中」→「已分享」
 10. 點「完成」（CDP，在 dialog 內）
+
+### 6. IG 新 UI「從電腦選擇」找不到的處理
+
+點擊「新貼文」後，dialog 內的「從電腦選擇」按鈕可能不在常規 DOM 查詢範圍內。處理順序：
+
+```python
+# 1. 先試 Playwright locator（最快）
+from_computer = ig.locator('button', has_text='從電腦').first
+if await from_computer.is_visible(timeout=3000):
+    await from_computer.click()
+
+# 2. 再試 CDP Runtime.evaluate（繞過 Playwright 的封裝）
+await page.evaluate("""
+    () => {
+        const targets = [
+            () => { const els = document.querySelectorAll('[role="dialog"] button'); for(const e of els) if(e.innerText?.includes('從電腦')) return e; },
+            () => { const els = document.querySelectorAll('[role="dialog"] [role="menuitem"]'); for(const e of els) if(e.innerText?.includes('從電腦')) return e; },
+            () => { const els = document.querySelectorAll('[role="dialog"] *'); for(const e of els) if(e.innerText?.trim()==='從電腦選擇') return e; },
+        ];
+        for (const fn of targets) { try { const el = fn(); if(el){ el.click(); return 'ok'; } } catch(e){} }
+        return null;
+    }
+""")
+
+# 3. 等 1.5s 再找一次（dialog 可能異步渲染）
+await asyncio.sleep(1.5)
+file_input = ig.locator('input[type="file"]').first
+```
+
+**永遠不要按 Escape 來關 OS 文件選擇窗口** — 設完 `set_input_files()` 後等 3s，OS 窗口會自動關閉，IG 自己處理。
 
 ### 6. 禁用方法
 - `keyboard.type()` 對任何元素 ❌（React state 收不到）
@@ -64,58 +94,58 @@ await asyncio.sleep(0.5)
 
 ## CDP 連線相容性（重要）
 
-### Chrome 146 + Playwright `connect_over_cdp`  hang 問題
+### Chromium CDP 連線方式（2026-05 實測）
 
-Chrome 146 (2025-06) 與 Playwright 1.50-1.58 的 `connect_over_cdp()` 在瀏覽器層級端點（`/devtools/browser/...`）存在已知 hang 問題。
+**徵狀：** 舊腳本用硬編碼 WS URL（如 `ws://localhost:9333/devtools/browser/xxx`），Chromium 重啟後 URL 失效，playwright 連線失敗。
 
-**徵狀：**
-- WebSocket 連線成功（log: `<ws connected>`）
-- 但 Playwright 在 `CRBrowser.connect()` 內部初始化時 hang 住
-- Timeout 60s 後仍無回應
-
-**已驗證工作正常的方案：**
+**✅ 唯一確定有效方案：HTTP endpoint（自動解析）**
 ```python
-# ✅ 方案A：直接用原始 CDP over websockets（通用，繞過 Playwright 連線）
-import asyncio, websockets, json
+# ✅ 這樣連 — HTTP URL，Playwright 自動解析
+browser = await p.chromium.connect_over_cdp('http://localhost:9333', timeout=30000)
+ctx = browser.contexts[0]
+page = await ctx.new_page()          # 可以開新分頁
+await page.goto('...')
 
-async def cdp_send(ws_url, method, params={}):
-    msg = {'id': 1, 'method': method, 'params': params}
-    async with websockets.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
-        await ws.send(json.dumps(msg))
-        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
-    return resp['result']
-
-# 用法：
-result = await cdp_send('ws://localhost:9333/devtools/page/xxx', 'Page.captureScreenshot')
-
-# ✅ 方案B：Page-level connect_over_cdp（單一頁面可用）
+# ❌ 硬編碼 WS URL（Chromium 重啟後失效）
 browser = await p.chromium.connect_over_cdp(
-    'ws://localhost:9333/devtools/page/xxx',  # 直接 page WS URL
-    timeout=20000
+    'ws://localhost:9333/devtools/page/xxx',  # 舊分頁 WS URL，重啟後無效
+    timeout=30000
 )
-```
 
-**確定失敗的方案：**
-```python
-# ❌ 瀏覽器層級 HTTP endpoint — hang
-browser = await p.chromium.connect_over_cdp('http://localhost:9333', timeout=60000)
-
-# ❌ 瀏覽器層級 WS URL — hang
+# ❌ 瀏覽器層級 WS URL（hang）
 browser = await p.chromium.connect_over_cdp(
     'ws://localhost:9333/devtools/browser/xxx',
     timeout=60000
 )
-
-# ❌ Playwright 的 connect()（非 CDP，是 Playwright 專有協議）
-browser = await p.chromium.connect(ws_url, timeout=60000)
 ```
 
-**底層原因：** Playwright Node.js driver 的 `CRBrowser.connect()` 在 `session.send("Browser.getVersion")` 和 `Target.setAutoAttach` 階段與 Chrome 146 的 CDP 实现有兼容性问题。
+**底層原因：** Chromium 重啟後，`/devtools/page/xxx` 的 WS URL 全部更換。HTTP endpoint (`http://localhost:9333`) 是 Chromium 的 CDP 入口，Playwright 自動從中取得目前有效的 WS URL 並連線。
+
+**驗證 Chromium 是否在跑：**
+```bash
+lsof -i :9333  # 應有 Chromium LISTEN
+curl -s http://localhost:9333/json  # 返回 tab 清單，說明 CDP 正常
+```
 
 ## CLI 用法
 ```bash
 uv run python -m social_mcp.post_ig "caption text" /tmp/social.jpg
 ```
+
+## 腳本 WS URL 陷阱
+
+`scripts/post_instagram.py` 內的 WS URL 是**啟動時動態決定的**（不能寫死）：
+```python
+# ✅ 動態（正確）
+async with async_playwright() as p:
+    browser = await p.chromium.connect_over_cdp('http://localhost:9333')
+    # Playwright 自動處理 WS URL 解析
+
+# ❌ 硬編碼（Chromium 重啟後失效）
+WS_URL = "ws://localhost:9333/devtools/page/xxx"  # 不要這樣寫
+```
+
+每次 Chromium 重啟（如系統睡眠喚醒），`/devtools/page/xxx` 和 `/devtools/browser/xxx` 都會更換，寫死在代碼裡的 WS URL 一定會在幾次後失效。
 
 ## 社交發文 Cron 故障排查
 
