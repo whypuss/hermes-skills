@@ -29,9 +29,36 @@ Mobile (Android/iOS)
 # Kill backend
 kill $(lsof -ti :8765) 2>/dev/null
 
-# Restart backend
-cd ~/.kimaki/projects/podcast-gen/backend && uv run --python .venv-tts/bin/python -m uvicorn main:app --port 8765 --host 0.0.0.0 &
+# Restart backend (model loads in background thread, server accepts requests immediately)
+cd ~/.kimaki/projects/podcast-gen/backend && .venv-tts/bin/python -m uvicorn main:app --port 8765 --host 0.0.0.0 &
+# Or with uv:
+cd ~/.kimaki/projects/podcast-gen/backend && uv run python -m uvicorn main:app --port 8765 --host 0.0.0.0 &
+```
 
+## Backend Startup — Background Model Loading
+main.py uses FastAPI `lifespan` event with a daemon thread to load the model. Server accepts requests immediately while model downloads (~40s on first run).
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    def _load():
+        try:
+            eng = get_engine(device="cpu", dtype=torch.float32)
+            log.info(f"[Startup] 模型已就緒: {eng.is_loaded}")
+        except Exception as e:
+            log.error(f"[Startup] 模型加載失敗: {e}")
+
+    thread = threading.Thread(target=_load, daemon=True)
+    thread.start()
+    log.info("[Startup] 模型後台加載中，server 已就緒接受請求...")
+    yield
+    global _engine
+    _engine = None
+
+app = FastAPI(title="Podcast Gen API", version="2.0.0", lifespan=lifespan)
+```
+
+If server starts but `/models/status` returns "加載失敗", wait 40s and retry — model is downloading in background.
 # Test backend directly
 curl http://127.0.0.1:8765/health
 curl http://127.0.0.1:8765/models/status
@@ -114,18 +141,22 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
 ## Deployment Steps
 
 ```bash
-# 1. Kill old servers (use PID, port lookup sometimes misses stale processes)
-lsof -ti :5174 | xargs ps -p 2>/dev/null | grep -v PID | awk '{print $1}' | xargs kill -9 2>/dev/null
+# 1. Kill old servers
+lsof -ti :5174 | xargs kill -9 2>/dev/null
 lsof -ti :8765 | xargs kill -9 2>/dev/null
+sleep 1
 
 # 2. Build Vue UI
 cd ~/.kimaki/projects/podcast-gen/vue-ui && npm run build
 
-# 3. Start backend (waits for Qwen3 model load ~20-30s)
-cd ~/.kimaki/projects/podcast-gen/backend && uv run --python .venv-tts/bin/python -m uvicorn main:app --port 8765 --host 0.0.0.0 &
+# 3. Start backend (model loads in background, server immediately ready)
+cd ~/.kimaki/projects/podcast-gen/backend && .venv-tts/bin/python -m uvicorn main:app --port 8765 --host 0.0.0.0 > /tmp/podcast-backend.log 2>&1 &
 
 # 4. Start serve.py
-cd ~/.kimaki/projects/podcast-gen/vue-ui && python3 serve.py &
+cd ~/.kimaki/projects/podcast-gen/vue-ui && python3 serve.py > /tmp/serve.log 2>&1 &
+
+# 5. Wait ~40s for model to download, then verify
+sleep 40 && curl http://127.0.0.1:8765/models/status
 ```
 
 ## Debug Commands
@@ -162,3 +193,4 @@ If mobile shows white screen:
 - Android/iOS browsers kill fetch requests when screen is off — user must keep screen on during TTS generation
 - Backend proxy timeout must be ≥ 300s (TTS generation takes 20-60s on CPU)
 - Vue `generate()` timeout must be ≥ 120000ms (2min)
+- Model first-load takes ~40s (downloading from HuggingFace). Backend accepts requests immediately via lifespan/threading. `/models/status` returns "加載失敗" during download — wait and retry.
