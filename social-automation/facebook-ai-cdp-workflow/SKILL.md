@@ -91,25 +91,58 @@ var allCE = document.querySelectorAll('[contenteditable="true"][role="textbox"]'
 var e = allCE.length > 0 ? allCE[0] : null;
 ```
 
-### 4. 圖片注入方式
-**舊（壞的）**：DataTransfer + base64 注入 → React input.files 不接受
-**新的（正確的）**：
+### 4. 圖片注入方式（2026-04-28 實測確認）
+
+**Facebook 不接受 `set_input_files`** — Playwright 的 `set_input_files` 無法觸發 Facebook React 的 `onChange` handler，導致 dialog 內 `imgs: 0`（圖片從未上傳）。
+
+**✅ 正確方式（commit 9ebd64b 實測成功）：base64→Blob→File→DataTransfer 注入**
+
+✅ 驗證成功信號：`blob:https://www.facebook.com/...` URL 出現在 dialog 內 img 標籤，確認 FB 已收到並處理圖片。
+✅ 發文成功驗證：文章出現 `scontent-hkg1-*.xx.fbcdn.net` CDN 網址，確認圖片真正上傳到 Facebook。
+
 ```python
-file_input = fb.locator('input[type="file"]').first
-await file_input.set_input_files(image_path)  # Playwright 原生方法
+import base64 as _b64
+with open(image_path, "rb") as f:
+    b64_data = _b64.b64encode(f.read()).decode()
+
+inject_r = await fb.evaluate("""(b64) => {
+    const binaryString = atob(b64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: 'image/jpeg' });
+    const file = new File([blob], 'upload.jpg', { type: 'image/jpeg', lastModified: Date.now() });
+    const inputs = document.querySelectorAll('input[type=file]');
+    for (let i = 0; i < inputs.length; i++) {
+        const inp = inputs[i];
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        Object.defineProperty(inp, 'files', {
+            value: dt.files, writable: true, configurable: true
+        });
+        const tracker = inp._valueTracker;
+        if (tracker) { tracker.setValue(''); }
+        inp.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        inp.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    }
+    return { ok: true, inputsUpdated: inputs.length };
+}""", b64_data)
 ```
 
+**驗證成功信號**：dialog 內出現 `blob:https://www.facebook.com/...` URL，說明 FB 已收到圖片並建立 blob URL。
+
 ### 5. 圖片預覽檢測位置
-新版 FB：blob URL **在 page 層級**，不在 dialog 內：
+新版 FB：blob URL **在 dialog 內**（commit 9ebd64b 實測確認）：
 ```javascript
-// 先在 dialog 內找
-var blobUrl = null;
-// ...
-// 新版 FB: blob img 在 page 層級
-if (!blobUrl) {
-    var pageBlobs = document.querySelectorAll('img[src^="blob:"]');
-    if (pageBlobs.length > 0) blobUrl = pageBlobs[0].src;
+var d = document.querySelector('[role=dialog]');
+if (!d) return null;
+var imgs = d.querySelectorAll('img[src]');
+for (var img of imgs) {
+    var src = img.src || '';
+    if (src.startsWith('blob:')) return src.slice(0, 80);
 }
+return null;
 ```
 
 ### 6. 強制刷新乾淨狀態
@@ -145,9 +178,9 @@ result = await fb.evaluate('''() => {
 
 ## 陷阱
 1. **不要等 networkidle** — FB 和 Trends 都會一直有請求
-2. **不要用 DataTransfer base64** — FB React 不接受，必須用 `set_input_files`
+2. **不要用 `set_input_files`** — Facebook React 不響應 `set_input_files`，必須用 `base64→Blob→File→DataTransfer` 注入
 3. **dialog 可能是關閉狀態** — 頁面載入就存在，需檢查 `hasEditor`
-4. **blob 在 page 不在 dialog** — 檢測預覽要查 page 層級
+4. **blob 在 dialog 內** — 圖片預覽 blob URL 在 dialog 內，不在 page 層級（實測確認）
 5. **human-mcp 用 localhost:8080** — AIpuss-browser 是 AIpuss-browser，human-mcp 是另一個 server
 6. **上傳後不要按 Escape** — OS 選擇框會自動關，Escape 干擾事件鏈
 ## Article 生成（已解決 — CDP Browser Gemini 無需登入）
