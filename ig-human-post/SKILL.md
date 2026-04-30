@@ -1,92 +1,146 @@
 ---
 name: ig-human-post
-description: Instagram 擬人發文流程（post_ig_human.py）— CDP Playwright 模式，繞過 OS dialog，React 事件觸發
+description: Instagram 擬人發文流程（post_ig_human.py）— 獨立 Chromium Profile + 語義點擊架構
 ---
 
-# IG 擬人發文流程
+# IG 擬人發文流程（新版）
 
 ## 觸發條件
 每次 social workflow 需要發 Instagram 時使用。
 
-## 完整流程（post_ig_human）
-1. CDP 連接 IG 頁面
-2. 點擊 `svg[aria-label="新貼文"]` → 等「建立新帖子」dialog
-3. `set_input_files()` 直接注入圖片到 `input[type=file]`（繞過 OS dialog）
-4. 等裁切頁（dialog text 含「裁切」）
-5. Playwright `.click()` 點擊「下一步」(裁切→濾鏡)
-6. Playwright `.click()` 點擊「下一步」(濾鏡→Caption)
-7. 找 `[role="dialog"] [role="textbox"]` → `fill(caption)`
-8. Playwright `.click()` 點擊「分享」
-9. 等 dialog 內「已分享」
-10. Playwright `.click()` 點擊「完成」
+## 架構演變
+
+### 舊版（CDP 模式）問題
+- 依賴 CDP port 9333 連接用戶 Chrome
+- CDP browser 有 captcha，tab 太多會崩潰
+- 座標點擊：`mouse.click(x, y)` → UI 變了就掛
+
+### 新版（獨立 Profile + 語義點擊）
+- 每個腳本用自己的 Chromium Profile：`/tmp/ig-chromium-profile/`
+- 不需要 CDP port、不需要提前打開瀏覽器
+- DOM 定位 + 自癒重試 → UI 改版也能運作
+
+## 完整流程（post_ig_human.py）
+
+```
+launch_persistent_context → Threads profile 目錄
+       ↓
+ensure_logged_in（檢查是否在 login 頁）
+       ↓
+點「新貼文」svg[aria-label="新貼文"]
+       ↓
+等「從電腦選擇」dialog
+       ↓
+file_chooser.set_files() 或 JS DataTransfer 注入圖片
+       ↓
+等 3s（IG 處理圖片）
+       ↓
+語義點擊「下一步」(裁切頁) → verify_after
+       ↓
+語義點擊「下一步」(濾鏡頁) → verify_after
+       ↓
+Caption 頁：找 [role="textbox"] → fill(caption)
+       ↓
+語義點擊「分享」 → verify_after
+       ↓
+等「已分享」→「完成」
+```
+
+## 語義點擊核心（SemanticBtn 類）
+
+```python
+class SemanticBtn:
+    """
+    三層 fallback：
+    1. getByRole(name=label) / locator(:text-is())
+    2. JS dispatchEvent（React 兼容性）
+    3. 自癒重試（按鈕還在？重試）
+    """
+
+    async def click(self, label: str, timeout: float = 10, max_retries: int = 3) -> bool:
+        for attempt in range(1, max_retries + 1):
+            # 策略1: getByRole
+            loc = container.get_by_role("button", name=label, exact=False)
+            if await loc.count() > 0 and await loc.first.is_visible():
+                await loc.first.click()
+
+            # 策略2: locator(:text-is)
+            loc = container.locator(f"button:has-text('{label}')")
+
+            # 策略3: JS 遍歷（textContent / aria-label）
+            # mouse.click(x, y) 搭配 dispatchEvent
+
+            # 驗證：按鈕是否消失（dialog 進入下一頁）
+            if still_visible_after_click and attempt < max_retries:
+                await asyncio.sleep(1.0)
+                continue  # 重試
+
+            return True
+        return False
+```
 
 ## 關鍵發現（調試精華）
 
-### 按鈕都是 DIV（不是 button）
-- `下一步`、`分享`、`完成` 都是 `<DIV>` 元素，`textContent === "下一步"`
-- 不能用 `querySelectorAll('button')`
-- aria-label 通常是空字串，不可靠
-
-### 正確定位策略（4 層 fallback）
+### 為什麼不用座標 click？
 ```python
-# 策略1: Playwright :text-is (完全匹配) — 最優先
-locator = page.locator(f'[role="dialog"] :text-is("{target}")').first
-if await locator.count() > 0:
-    await locator.click(timeout=5000)
+# ❌ 舊：UI 變了就掛
+await page.mouse.click(640, 400)
 
-# 策略2: Playwright :text (包含匹配)
-locator = page.locator(f'[role="dialog"] :text("{target}")').first
-
-# 策略3: aria-label
-targets = dialog.querySelectorAll(`[aria-label="{target}"]`)
-
-# 策略4: CDP evaluate + MouseEvent（已失效，React 不響應）
+# ✅ 新：DOM 定位，UI 變了只要文字還在就能找到
+await page.get_by_role("button", name="下一步").click()
 ```
 
-### Playwright locator 是首選（而非 CDP JS）
-- `下一步`、`分享`、`完成` 都是 `<DIV>`，`textContent === "下一步"`
-- 用 Playwright `:text("下一步")` locator，最可靠：
-  ```python
-  locator = page.locator('[role="dialog"] :text-is("下一步")').first
-  await locator.click(timeout=5000)
-  ```
-- CDP `dispatchEvent(new MouseEvent('click'))` 無法觸發 React synthetic event，**千萬不要用**
+### 為什麼不用 CDP？
+- CDP Chromium 9333 有 Google captcha（Google 對 CDP browser 態度不同）
+- Tab 太多導致崩潰
+- CDP port 管理複雜
+- 解決：`launch_persistent_context` 每個腳本獨立 Chromium，不影響用戶正常 Chrome
 
-### Gemini 處理狀態不可靠
-- Gemini 回覆文字已存在時，`processing-state-visible` class 可能仍為 true
-- 每次輪詢都應該拿文字內容，不要等 `status == 'done'`
-- 實測：等待超過 20 個 cycle（80s）還是 proc，但文字已完整（255+ chars）
-- 解決：每 4s 輪詢，直接取 `innerText`，不用等狀態
+### 為什麼不用 CDP dispatchEvent？
+- React 3.x 用 synthetic event，`dispatchEvent` 直接觸發 DOM event，不走 React 事件系統
+- 但 Playwright `.click()` 會觸發 React synthetic event
+- 所以用 Playwright locator，React 才會響應
 
-### CDP 分頁管理（重要）
-- CDP Chromium 9333 累積過多分頁會導致效能問題和 prompt 污染
-- **永遠保持 ≤ 6 個分頁**，及時關閉不需要的
-- 關閉策略：只保留 `instagram.com`、`threads.com`、`trends.google.com`、`facebook.com`
-- Gemini 網頁介面無乾淨 session，每次請求會吃到歷史 context → prompt 容易被污染
-
-### 兩個人類-mcp 目錄（容易混淆）
-- `~/human-mcp/` — 真正在跑、有 `/scrape` 端點的版本（綁定 GitHub）
-- `~/.kimaki/projects/human-mcp/` — 舊備份，無 `/scrape`
-- human-mcp 技能綁定 GitHub：`https://github.com/whypuss/human-mcp`
-
-## 文件位置
-`/Users/whypuss/.kimaki/projects/ai-cdp-browser/social_mcp/post_ig_human.py`
-- `dispatchEvent` 繞過了 React 的事件系統
-- Playwright `.click()` 會調用 React 的事件處理函數
+### JS DataTransfer 注入圖片（仍然有效）
+```python
+# OS file chooser 在 headless/CDP mode 無法操作
+# 用 JS DataTransfer 繞過：
+result = await page.evaluate("""(b64) => {
+    const blob = new Blob([bytes], { type: 'image/jpeg' });
+    const file = new File([blob], 'upload.jpg', ...);
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    Object.defineProperty(inp, 'files', { value: dt.files, writable: true });
+    inp.dispatchEvent(new Event('change', { bubbles: true }));
+}""", b64)
+```
 
 ## 文件位置
-`/Users/whypuss/.kimaki/projects/ai-cdp-browser/social_mcp/post_ig_human.py`
+
+- IG: `~/human-mcp/post_ig_human.py`
+- FB: `~/human-mcp/post_facebook.py`
+- Threads: `~/human-mcp/post_threads.py`
 
 ## 使用方式
+
+```bash
+# 第一次（需手動登入一次）
+python3 post_ig_human.py "測試 caption" "/path/to/image.jpg"
+
+# workflow 調用
+python3 social_workflow.py 1  # 自動發 FB + Threads + IG
+```
+
 ```python
 import asyncio
-from social_mcp.post_ig_human import post_ig_human
+from post_ig_human import post_ig_human
 
-result = asyncio.run(post_ig_human("caption text 🌸", "/path/to/image.jpg"))
-print(result)  # "✅ Instagram 發文成功" 或 "❌ 錯誤描述"
+result = asyncio.run(post_ig_human("caption text", "/path/to/image.jpg"))
+# "✅ Instagram 發文成功" 或 "❌ 錯誤描述"
 ```
 
 ## 依賴
-- `social_mcp.browser_hijack.get_active_cdp_port()`
+
 - `playwright.async_api.async_playwright`
-- CDP port 9333（FacebookMCP Chromium）
+- Chromium Profile: `/tmp/ig-chromium-profile/`
+- **無需 CDP port**、無需提前打開瀏覽器

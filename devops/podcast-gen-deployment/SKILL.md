@@ -36,6 +36,12 @@ cd ~/.kimaki/projects/podcast-gen/backend && uv run python -m uvicorn main:app -
 ```
 
 ## Backend Startup — Background Model Loading
+## TTS Engine
+**qwen3 tts**（Qwen TTS），不是 SherpaTTS。代碼：
+```python
+from qwen3_tts_engine import Qwen3TTSEngine, get_engine
+```
+
 main.py uses FastAPI `lifespan` event with a daemon thread to load the model. Server accepts requests immediately while model downloads (~40s on first run).
 
 ```python

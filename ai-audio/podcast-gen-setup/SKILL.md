@@ -11,12 +11,22 @@ tags: [tts, qwen3, podcast, vue3, fastapi]
 - 後端：`~/.kimaki/projects/podcast-gen/backend/`
 - Vue UI：`~/.kimaki/projects/podcast-gen/vue-ui/`
 
-## 架構
+## 架構（非阻塞 + 輪詢）
 
 ```
 Vue3 UI (port 5174) ←→ Python Proxy Server ←→ FastAPI Backend (port 8765)
                                                  ←→ Qwen3-TTS Model
+                                                    ↓ ThreadPoolExecutor
+                                                 /jobs/{job_id} 輪詢端點
 ```
+
+### 非同步流程（關鍵！）
+1. `POST /generate` — 立即返回 `{job_id, status: "running"}`（< 0.1s）
+2. 後端 `ThreadPoolExecutor(max_workers=2)` 在後台執行 TTS 生成（2-5 分鐘）
+3. 前端每 3 秒輪詢 `GET /jobs/{job_id}` 直到 `status: "done"` 或 `"failed"`
+4. `GET /jobs/{job_id}?format=json` — 返回 `{job_id, status, segments, output_path, success}`
+
+**為什麼這樣設計：** iPhone 移動網路 HTTP 請求超時 30-60 秒，而 Qwen3 CPU 生成需 2-5 分鐘。非阻塞才能避免斷連。
 
 ## 啟動方式
 
@@ -75,6 +85,19 @@ python3 serve.py
   "female_voice": "vivian"
 }
 ```
+→ 立即返回 `{"job_id": "abc123", "status": "running"}`
+
+## jobs GET 回應
+```json
+// running 時：
+{"job_id": "abc123", "status": "running"}
+
+// done 時：
+{"job_id": "abc123", "status": "done", "segments": [...], "output_path": "/tmp/...", "success": true}
+
+// failed 時：
+{"job_id": "abc123", "status": "failed", "error": "所有段落生成失敗"}
+```
 
 ## TailScale 部署（重要！）
 
@@ -90,24 +113,18 @@ python3 serve.py
 3. **API_PATHS 判斷** — 以 `startswith` 匹配 `/generate`, `/models`, `/health`, `/download`
 4. **urllib.request.urlopen** — 比 `subprocess` curl 更穩定
 
-## Timeout 設置（關鍵！）
+## Timeout 設置
 
-TTS 生成在 CPU 上需要 20-30 秒，必須設置足夠的超時：
-
-- **Vue App (`App.vue`)** — generate fetch timeout：**120 秒**
-- **serve.py proxy** — `urllib.request.urlopen(timeout=300)`：**300 秒**
-- **禁止**用 Node.js server（會導致 TCP 握手成功但 HTTP 無 response）
+由於非同步輪詢設計，不再需要長 HTTP timeout：
+- **Vue App poll** — 每 3 秒輪詢，fetch 本身 < 5 秒
+- **serve.py proxy** — urlopen timeout 120 秒（夠輪詢間隔用）
 
 ### 進程管理
 每次重啟 backend 前，必須 kill 乾淨：
 ```bash
-# 殺掉所有佔用 port 的進程
 lsof -i :8765 -i :5174 | grep LISTEN | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null
 sleep 1
-# 重新啟動
 ```
-
-常見問題：多個 backend 實例同時在 8080 和 8765 跑，導致請求被隨機分配到卡住的實例。
 
 ### serve.py 穩定性
 serve.py 在後端處理慢或重啟時會卡死（CLOSE_WAIT 僵屍連接）。跡象：
@@ -127,11 +144,13 @@ curl http://localhost:8765/health
 # 3. 模型已載入（第一次可能 30 秒，之後 instant）
 curl http://localhost:8765/models/status
 
-# 4. 完整 generate 測試
-curl -X POST http://localhost:5174/generate \
+# 4. generate 測試（立即返回 job_id）
+curl -X POST http://localhost:8765/generate \
   -H "Content-Type: application/json" \
-  -d '{"script":"[男] 測試","language":"mandarin","speed":1,"male_voice":"uncle_fu","female_voice":"vivian"}' \
-  --max-time 60
+  -d '{"script":"[男] 測試","language":"mandarin","speed":1,"male_voice":"uncle_fu","female_voice":"vivian"}'
+
+# 5. 輪詢結果（等待 30 秒後）
+curl http://localhost:8765/jobs/<job_id>
 ```
 
 ## 已知的坑
