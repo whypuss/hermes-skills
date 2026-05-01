@@ -83,13 +83,28 @@ pkill -f bot.py && sleep 1 && cd /root/tg-card-bot && nohup python3 bot.py > bot
 - GitHub 倉庫：**https://github.com/whypuss/tg-card-bot**
 - 輕量版腳本：`scripts/tg-card-bot-deploy.sh`（推薦，requests + sqlite3，無 async，256MB 够用）
 - 直接 wget 部署：
-```bash
-wget -O /tmp/d.sh https://raw.githubusercontent.com/whypuss/tg-card-bot/main/scripts/tg-card-bot-deploy.sh && bash /tmp/d.sh
-```
+## Bot 代碼（GitHub）
+- **正式項目**：https://github.com/whypuss/tg-card-bot
+- Light v1（穩定，已在 VPS 成功運行）：`bot.py` — requests + sqlite3，無 async，30MB 記憶體
+- Inline v2（按鈕版，含購買流程 + 管理員發貨/拒絕）：同上 `bot.py`
+- 部署腳本：`scripts/tg-card-bot-deploy.sh`
+
+## ⚠️ 踩坑記錄（持續更新）
+
+### 按鈕版 v2 崩潰（2026-05-01，暫未解決）
+- **症狀**：`nohup python3 bot.py` 後 `bot.log` 完全空白，Bot 無輸出直接退出
+- **排查方法**：前台運行 `python3 bot.py` 看真實錯誤
+- **懷疑原因**：`allowed_updates` 含 `callback_query` 但 getUpdates 初始化或 offset 邏輯有問題
+- **解決方案**：還在排查中，暫時可用 light v1
+
+### 7. Rust 版部署失敗記錄（不要在這台 VPS 嘗試）
+- **Mac 交叉編譯失敗**：Mac (aarch64-apple-darwin) → x86_64-unknown-linux-musl，rust-openssl-sys 找不到 OpenSSL
+- **VPS 編譯 OOM**：Alpine 256MB RAM 裝 Rust + cargo build → OOM (Killed)，並且沒有 curl（只有 wget）
+- **結論**：這台 VPS 只能跑 Python 版
 
 ## 已知限制
 - 目前購買是「直接發貨」模式，無實際支付集成
-- 需要接入真實支付（支付寶/微信/加密貨幣）可後續擴展
+- 需要接入真實支付（USDT TRC20）可後續擴展
 
 ## GitHub 倉庫
 - https://github.com/whypuss/tg-card-bot
