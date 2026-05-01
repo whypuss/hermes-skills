@@ -1,148 +1,144 @@
 ---
 name: tg-card-bot-alpine-vps
-description: 在 Incudal Alpine Linux VPS 上部署 Telegram 發卡機器人（aiogram + SQLite），解決 pip externally-managed 問題
+description: 在 Incudal Alpine Linux VPS（256MB RAM）上部署 Telegram 發卡機器人（requests + sqlite3，Light 版）
 category: devops
 ---
 
 # TG 發卡機器人 - Alpine VPS 部署流程
 
 ## 背景
-在 Incudal Alpine Linux VPS（256MB RAM，無 GPU）上部署 Telegram 發卡機器人（軟件 + 會員訂閱）。
+- **平台**: Incudal Alpine Linux VPS，256MB RAM
+- **Repo**: https://github.com/whypuss/tg-card-bot
+- **技術棧**: Python requests + 內建 sqlite3，無 async，30MB 記憶體
 
 ---
 
-## 踩坑記錄（真機實測）
+## 踩坑實測記錄（2025-05-01 實戰）
 
-### 1. SSH 連接
-- IP: `149.56.18.147`，Port: `22`
-- 預設只接受 SSH Key 登入，不接受密碼
-- 用戶需通過雲後台（Incudal web console）開通密碼登入
-
-### 2. Alpine Linux 特性
-- **沒有 curl**，只有 wget
-- **PEP 668**: Python externally-managed，直接 pip install 會被拒絕
-  - 解法: `pip3 install ... --break-system-packages`
-  - venv 方式也可：`python3 -m venv /opt/venv && /opt/venv/bin/pip install ...`
-
-### 3. aiosqlite 不存在
-- Alpine 的 PyPI 中 aiosqlite 最新是 `0.22.1`（不是 3.1.2）
-- **解法**: 用 Python 內建 `sqlite3`
-
-### 4. 成功部署案例（2025-05-01）
-- **Bot Token**: `8220575198:AAEJK-9BNBIW1qnshUeF4amAisUHPEbiwBA`
-- **Admin ID**: `1120349178`
-- **VPS**: Incudal Alpine，149.56.18.147，256MB RAM
-- **部署方式**：wget 下載 `tg-card-bot-deploy.sh` → 直接運行 → nano 改配置 → nohup 後台啟動
-- **記憶體佔用**：約 30MB（requests + sqlite3，無 async）
-
-### 5. ⚠️ 256MB RAM 不够用 aiogram（關鍵！）
-- aiogram + aiohttp 在 256MB 上會記憶體不足崩潰（RuntimeError 或 Killed）
-- **解法**: 棄用 aiogram，改用極簡方案：`requests` + 內建 `sqlite3` + `time.sleep` 輪詢
-  - 不需要 async/await
-  - 不需要 aiohttp / aiogram
-  - 記憶體佔用極小，256MB 完全够用
-  - 輕量版腳本：`scripts/tg-card-bot-light.sh`
-  ```bash
-  wget -O /tmp/light.sh https://raw.githubusercontent.com/whypuss/hermes-skills/main/scripts/tg-card-bot-light.sh && chmod +x /tmp/light.sh && bash /tmp/light.sh
-  ```
-
-## 完整步驟（輕量版 — 256MB RAM 首選）
-
-### 1. 一鍵腳本
+### 1. wget 下載文件編碼損壞
+- 症狀：`bot.py` 中的 `**` 變成亂碼，`sys` 變 `svs`
+- 原因：Alpine wget 編碼問題
+- 解決：用 Python 下載
 ```bash
-wget -O /tmp/d.sh https://raw.githubusercontent.com/whypuss/tg-card-bot/main/scripts/tg-card-bot-deploy.sh && bash /tmp/d.sh
+python3 -c "import urllib.request; open('/root/tg-card-bot/bot.py','w',encoding='utf-8').write(urllib.request.urlopen('https://raw.githubusercontent.com/whypuss/tg-card-bot/main/bot.py').read().decode('utf-8'))"
 ```
 
-### 2. 配置 Token
+### 2. dotenv 沒加載（BOT_TOKEN 一直是假的，404 Not Found）
+- 必須：`from dotenv import load_dotenv` + `load_dotenv("/root/tg-card-bot/.env")`
+- Alpine 需先：`pip3 install python-dotenv --break-system-packages`
+
+### 3. callback_data 不匹配（按鈕無反應，日誌無錯誤）
+- 原因：`product_kb` 返回 `"home"`，但 `handle_callback` 只判斷 `"list_all"`
+- 解決：`if data in ("list_all", "home"):`
+
+### 4. 數據庫缺欄位（Bot 崩潰，sqlite3.OperationalError）
+- 新版代碼多了：`pay_addr`、`status`、`uname`、`pname`、`card`
+- 舊資料庫需迁移，一次性補欄位：
 ```bash
-nano /root/tg-card-bot/.env
-# 填入 BOT_TOKEN 和 ADMIN_ID
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('/root/tg-card-bot/cards.db')
+c = conn.cursor()
+cols_p = [i[1] for i in c.execute('PRAGMA table_info(products)')]
+if 'pay_addr' not in cols_p: c.execute('ALTER TABLE products ADD COLUMN pay_addr TEXT DEFAULT \"\"')
+cols_o = [i[1] for i in c.execute('PRAGMA table_info(orders)')]
+for col, dtype in [('status','pending'),('uname',''),('pname',''),('card','')]:
+    if col not in cols_o: c.execute(f'ALTER TABLE orders ADD COLUMN {col} TEXT DEFAULT \"{dtype}\"')
+conn.commit(); conn.close(); print('DONE')
+"
 ```
 
-### 3. 啟動
-```bash
-cd /root/tg-card-bot && nohup python3 bot.py > bot.log 2>&1 &
-```
+### 5. edit_msg 內容不變被 Telegram 忽略
+- 如果編輯後文字和原來完全一樣，Telegram 不會更新
+- 按鈕看起來像「卡住」，但日誌無錯誤
+- 解決：先用 `answer_cb` 回應確認，或編輯時稍微改動文字
 
-### 4. 查看日誌
-```bash
-tail -f /root/tg-card-bot/bot.log
-```
+### 6. 256MB RAM 不能跑
+- Rust 編譯：OOM
+- aiogram + aiohttp：OOM
+- 只能用 `requests` + 內建 `sqlite3`，無 async
+- `getUpdates timeout=30`，`sleep=0.3`
 
-### 5. 殺掉舊進程（如需重啟）
-```bash
-pkill -f bot.py && sleep 1 && cd /root/tg-card-bot && nohup python3 bot.py > bot.log 2>&1 &
-```
+### 7. print lambda 覆蓋自己造成 RecursionError
+- 錯誤代碼：`print = lambda *a,**kw: (print(*a,**kw), sys.stdout.flush())`
+- 解決：改用普通函數 `def log(*a,**kw): print(*a,**kw); sys.stdout.flush()`
 
-### 7. Rust 版部署失敗記錄（不要在這台 VPS 嘗試）
-- **Mac 交叉編譯失敗**：Mac (aarch64-apple-darwin) → x86_64-unknown-linux-musl，rust-openssl-sys 找不到 OpenSSL（$HOST = aarch64-apple-darwin）
-- **VPS 編譯 OOM**：Alpine 256MB RAM 裝 Rust + cargo build → OOM (Killed)，並且沒有 curl（只有 wget）
-- **結論**：這台 VPS 只能跑 Python 輕量版
+### 8. 舊訂單數據導致 "已有 pending 訂單"（用戶買不了）
+- 解決：`UPDATE orders SET status='cancelled' WHERE status='pending'`
 
-## Bot 代碼
-- GitHub 倉庫：**https://github.com/whypuss/tg-card-bot**
-- 輕量版腳本：`scripts/tg-card-bot-deploy.sh`（推薦，requests + sqlite3，無 async，256MB 够用）
-- 直接 wget 部署：
-## Bot 代碼（GitHub）
-- **正式項目**：https://github.com/whypuss/tg-card-bot
-- Light v1（穩定，已在 VPS 成功運行）：`bot.py` — requests + sqlite3，無 async，30MB 記憶體
-- Inline v2（按鈕版，含購買流程 + 管理員發貨/拒絕）：同上 `bot.py`
-- 部署腳本：`scripts/tg-card-bot-deploy.sh`
-
-## ⚠️ 踩坑記錄（持續更新）
-
-### 按鈕版 v2 崩潰（2026-05-01，暫未解決）
-- **症狀**：`nohup python3 bot.py` 後 `bot.log` 完全空白，Bot 無輸出直接退出
-- **排查方法**：前台運行 `python3 bot.py` 看真實錯誤
-- **懷疑原因**：`allowed_updates` 含 `callback_query` 但 getUpdates 初始化或 offset 邏輯有問題
-- **解決方案**：還在排查中，暫時可用 light v1
-
-### 7. Rust 版部署失敗記錄（不要在這台 VPS 嘗試）
-- **Mac 交叉編譯失敗**：Mac (aarch64-apple-darwin) → x86_64-unknown-linux-musl，rust-openssl-sys 找不到 OpenSSL
-- **VPS 編譯 OOM**：Alpine 256MB RAM 裝 Rust + cargo build → OOM (Killed)，並且沒有 curl（只有 wget）
-- **結論**：這台 VPS 只能跑 Python 版
-
-## 已知限制
-- 目前購買是「直接發貨」模式，無實際支付集成
-- 需要接入真實支付（USDT TRC20）可後續擴展
-
-## GitHub 倉庫
-- https://github.com/whypuss/tg-card-bot
-- 包含 bot.py（Light 版）+ 一鍵部署腳本
+### 9. answerCallbackQuery 10秒超時
+- Telegram 要求在 10s 內回應，否則 query 過期
+- Long Polling 迴圈太慢會導致按鈕圈圈轉但無反應
+- 解決：確保 `time.sleep(0.3)` 不是 `time.sleep(5)`
 
 ---
 
-## 🔴 關鍵故障：Bot 收到消息但不回應（試錯記錄）
+## 部署步驟（全新 VPS）
 
-### 根因：timeout=1 太短
-- getUpdates timeout=1 → 每秒發請求 → 超時馬上 sleep(5)
-- Bot 98% 時間在 sleep，根本沒機會處理回覆
-- 解決：**timeout=30**（Long Polling，Telegram 官方推薦）
-
-### 根因：getUpdates 被其他客戶端消費
-- 手動 curl/wget 查 API 時把 /start 消息消費掉了
-- Bot 輪詢時 offset 已經跳過那條消息
-- 解決：先清空積壓 `getUpdates?offset=-1`，然後馬上啟動 Bot，再發 /start
-
-### 根因：DB 連線未 explicit close
-- Alpine + HDD 環境，SQLite 文件鎖反應慢
-- `with get_db()` 雖然有 GC，但 HDD 上不及時
-- 解決：每次 `db.execute()` 後馬上 `db.close()`
-
-### 根因：ADMIN_ID 類型匹配
-- `.env` 讀進來是字串，轉 `int()` 後與 Telegram 回傳的 `cid` 比較
-- 要確保兩邊都是 int
-
-### 最終穩定版關鍵參數
-| 參數 | 值 | 備註 |
-|------|-----|------|
-| getUpdates timeout | 30s | Long Polling，不是 1s |
-| requests timeout | 35s | 比 Telegram 多 5s |
-| sleep between loops | 0.2s | 不是 5s |
-| sendMessage timeout | 10s | |
-| DB close | 每次操作後 | 顯式 close() |
-
-### 穩定版部署（一行）
+### 1. 安裝依賴
 ```bash
-wget -O /tmp/final.sh https://raw.githubusercontent.com/whypuss/hermes-skills/main/scripts/tg-card-bot-final.sh && bash /tmp/final.sh && cd /root/tg-card-bot && python3 bot.py
+apk add --no-cache python3 py3-pip
+pip3 install requests python-dotenv --break-system-packages
 ```
+
+### 2. 下載並配置
+```bash
+mkdir -p /root/tg-card-bot
+python3 -c "import urllib.request; open('/root/tg-card-bot/bot.py','w',encoding='utf-8').write(urllib.request.urlopen('https://raw.githubusercontent.com/whypuss/tg-card-bot/main/bot.py').read().decode('utf-8'))"
+
+cat > /root/tg-card-bot/.env << 'EOF'
+BOT_TOKEN=你的BOT_TOKEN
+ADMIN_ID=你的TG用戶ID
+EOF
+```
+
+### 3. 初始化數據庫欄位
+```bash
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('/root/tg-card-bot/cards.db')
+c = conn.cursor()
+cols_p = [i[1] for i in c.execute('PRAGMA table_info(products)')]
+if 'pay_addr' not in cols_p: c.execute('ALTER TABLE products ADD COLUMN pay_addr TEXT DEFAULT \"\"')
+cols_o = [i[1] for i in c.execute('PRAGMA table_info(orders)')]
+for col, dtype in [('status','pending'),('uname',''),('pname',''),('card','')]:
+    if col not in cols_o: c.execute(f'ALTER TABLE orders ADD COLUMN {col} TEXT DEFAULT \"{dtype}\"')
+conn.commit(); conn.close()
+"
+```
+
+### 4. 啟動
+```bash
+cd /root/tg-card-bot && nohup python3 bot.py >> bot.log 2>&1 &
+```
+
+### 5. 重啟（如需）
+```bash
+pkill -9 -f bot.py && rm -f /root/tg-card-bot/cards.db-journal && nohup python3 /root/tg-card-bot/bot.py >> /root/tg-card-bot/bot.log 2>&1 &
+```
+
+---
+
+## 常見日誌錯誤
+
+| 日誌 | 原因 | 解決 |
+|------|------|------|
+| `no such column: pay_addr` | 缺欄位 | ALTER TABLE 補欄位 |
+| `no such column: status` | 缺欄位 | ALTER TABLE 補欄位 |
+| `404 Not Found` | BOT_TOKEN 假的 | 確認 .env 正確 + load_dotenv |
+| `ADMIN=0` | dotenv 未加載 | 加 `from dotenv import load_dotenv` |
+| `Network unreachable` | VPS 網絡問題 | `curl -I https://api.telegram.org` |
+| `[收到 N個更新]` 但 Bot 無回應 | getUpdates 被其他客戶端消費 | 先 `getUpdates?offset=-1` 清空積壓 |
+| 按鈕圈圈一直轉 | query 超時或 edit_msg 內容相同 | 加快輪詢或改文字 |
+
+## 管理員指令
+- `/start` - 主介面
+- `/admin` - 商品列表
+- `/stock` - 庫存
+- `/orders` - 訂單
+- `/add 名稱` - 逐步添加商品
+- `/setprice ID 價格`
+- `/setstock ID 數量`
+- `/setaddr ID TRC20地址`
+- 然後直接回复卡密內容（每行一組）
+- `/cancel` - 取消當前操作
