@@ -14,9 +14,21 @@ Need Cantonese TTS that actually produces Cantonese pronunciation (not Mandarin 
 
 ## Setup
 
+### 安裝 sherpa-onnx（在項目 venv 中）
+
 ```bash
-pip install sherpa-onnx hf_transfer
-HF_HUB_ENABLE_HF_TRANSFER=1 python -c "from huggingface_hub import snapshot_download; print(snapshot_download('csukuangfj/vits-cantonese-hf-xiaomaiiwn'))"
+# 項目 venv（用 uv 管理）
+uv pip install sherpa-onnx --python /path/to/.venv/bin/python
+
+# 全域
+pip install sherpa-onnx
+```
+
+### 下載模型
+
+```bash
+pip install hf_transfer
+HF_HUB_ENABLE_HF_TRANSFER=1 python -c \"from huggingface_hub import snapshot_download; print(snapshot_download('csukuangfj/vits-cantonese-hf-xiaomaiiwn'))\"
 ```
 
 Model lands at: `~/.cache/huggingface/hub/models--csukuangfj--vits-cantonese-hf-xiaomaiiwn/snapshots/<hash>/`

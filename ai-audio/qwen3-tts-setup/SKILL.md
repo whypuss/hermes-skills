@@ -90,10 +90,28 @@ wavs, sr = model.generate_voice_clone(
 - `non_streaming_mode=True`：同步生成
 - `speed`：目前 qwen-tts 內部不支援 speed 參數，設了也無效
 
+## 替代 TTS 方案對照
+
+| 模型 | 架構 | Cantonese | 質量 | CPU 速度 | 本地部署 |
+|------|------|-----------|------|---------|---------|
+| **Qwen3-TTS** | 自研離散 tokens | LoRA 可做 | 高 | 極慢（需 GPU） | 可 |
+| **CosyVoice 2** | 輔助向量量化 + 因果 transformer | 較好 | 極高 | 慢 | 需 GPU |
+| **GPT-SoVITS** | VITS + GPT 蒸餾 | 需微調 | 高 | 中等 | 可（Mac CPU） |
+| **F5-TTS** | Diffusion + 自迴歸 | 有限 | 高 | 中等 | 可 |
+| **MeloTTS** | VITS 變體 | 需模型 | 中等 | 快 | 可（Mac CPU） |
+| **VALL-E X** | 量化 codec + GPT | 需微調 | 高 | 慢 | 可 |
+
+### 選型建議
+- **需 GPU**：CosyVoice 2 質量最好，多語言支援完善
+- **Mac CPU 優先**：GPT-SoVITS 或 MeloTTS 可跑
+- **自訂音色（LoRA）**：目前只有 Qwen3-TTS 支援 Megatron LoRA；GPT-SoVITS 可訓練自訂音色
+- **快速推理**：MeloTTS 最快，但質量中等
+
 ## 限制
 - CPU 推理慢（約 0.5x 即時率），10 秒音頻需 20+ 秒
 - Mac 上 flash-attn 不可用，會有 warning 但不影響運行
 - SoX 找不到會有 warning 但不影響運行
+- Qwen3-TTS LoRA（whypuss/cantonese_lora_backup）用 Megatron 訓練，無法直接合併到 HuggingFace 模型
 
 ## 陷阱
 - **千萬不要**用 `Qwen/Qwen3-TTS-12Hz-0.6B-Base`（Base 型號不支援 VoiceDesign / CustomVoice 功能）
