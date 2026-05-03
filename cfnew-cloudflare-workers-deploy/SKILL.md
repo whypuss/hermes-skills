@@ -85,44 +85,58 @@ wrangler deploy
 
 ## 疑難排斷 Protocol（1101 錯誤）
 
-當 Worker 返回 `error code: 1101` 時：
+當 Worker 返回 `error code: 1101` 時，**即使 KV 已正確綁定、程式碼本地 dev 正常、Logs 顯示 0 事件**：
 
-1. **確認 KV 綁定存在**：Cloudflare Dashboard → Workers → cfnew → Bindings → 有看見 `C` 的 KV Namespace
-2. **隔離問題**：建立一個最小測試 Worker 確認 KV 本身是否正常
+### Step 1：確認不是 KV 綁定問題
+Cloudflare Dashboard → Workers → cfnew → Bindings → 確認有 `C` 的 KV Namespace。
 
-```javascript
-// /tmp/cfnew_test/test_worker.js
-export default {
-  async fetch(request, env, ctx) {
-    if (env.C) {
-      await env.C.put('test', 'hello');
-      return new Response('KV works: ' + await env.C.get('test'));
-    }
-    return new Response('KV not bound', { status: 500 });
-  }
-};
-```
-
-```toml
-# wrangler.toml
-name = "cfnew-test"
-main = "test_worker.js"
-compatibility_date = "2024-01-20"
-kv_namespaces = [{ binding = "C", id = "你的KV_ID" }]
-```
-
+### Step 2：用不同名稱測試
 ```bash
-mkdir -p /tmp/cfnew_test
-# 放上述檔案進去
-cd /tmp/cfnew_test && wrangler deploy
-curl https://cfnew-test.agooxo.workers.dev/
-# 如果返回 "KV works: hello" → KV 正常，問題在原始碼
-# 如果返回 "KV not bound" → KV binding 設定問題
+# 用不同 worker 名稱部署同一份程式碼
+wrangler deploy --name cfnew-test-alt
+curl https://cfnew-test-alt.{account}.workers.dev/
 ```
+如果新名稱正常 → **Worker 名稱本身有殘留狀態**（不是程式碼問題）。
 
-3. **原始碼本身問題**：GitHub 下載的原始碼可能含 Runtime Bug（342KB 代碼本身並非完美）
-   - Cloudflare Dashboard → Workers → cfnew → **Logs** 查看錯誤堆疊
-   - 檢查 GitHub Issues 有無類似回報
+### Step 3：根因 + 解法（！）
+**Worker 名稱在 Cloudflare 系統內有損壞的內部狀態**，可能來自：
+- 之前刪除 KV binding 或變更 binding 設定
+- 早期部署殘留的元數據衝突
+- 同名 worker 刪除後未完全清理
+
+**解法：完全刪除再重建（不能只靠 redeploy）**
+```bash
+wrangler delete cfnew --force
+# 然後重新部署（wrangler deploy 會自動創建新的）
+echo $UUID | wrangler secret put u --name cfnew
+wrangler deploy
+```
+實測：同一份 worker_fixed.js，刪除重建後 HTTP 200，直接 deploy（不刪）還是 1101。
+
+### Step 4：本地 dev 驗證
+```bash
+wrangler dev --name cfnew --port 8787
+# 另外終端
+curl http://localhost:8787/
+```
+本地正常 = 程式碼沒問題，問題在雲端部署狀態。
+
+### Step 5：其他已知 1101 原因
+- KV 未綁定 → 綁定後重建
+- `cloudflare:sockets` 在不支援的 plan 上使用 → 確認 Workers 付費計劃
+- Worker 腳本過大（>10MB compressed）→ 檢查上傳大小
+
+### Step 6：根因確認——Worker 名稱本身狀態損壞（！）【2026-05-03 實測】
+如果同一份程式碼：
+- wrangler dev 本地運行 → 正常
+- 部署到新 worker 名稱（如 cfnew-test-alt）→ 正常
+- 部署到舊 worker 名稱（cfnew）→ 1101
+
+結論：Worker 名稱在 Cloudflare 內部有損壞狀態（可能來自之前刪除 KV binding、變更 binding、或不完整刪除殘留）。**不是程式碼問題，是 worker 名稱狀態問題。**
+
+解法：必須完全刪除 worker 再重建（wrangler delete --force + 重新 deploy，單純 redeploy 不夠）。
+
+實測刪除重建後 200，直接 deploy（不刪）還是 1101。
 
 ## 重要：wrangler.toml 的位置
 
